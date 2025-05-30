@@ -4,11 +4,13 @@ from base64 import b64encode
 from glob import glob
 from io import StringIO
 import tempfile
-from typing import Tuple, Union
+import zipfile
+import shutil
+from typing import Tuple, Union, List
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from magic_pdf.data.read_api import read_local_images, read_local_office
@@ -30,6 +32,7 @@ app = FastAPI()
 pdf_extensions = [".pdf"]
 office_extensions = [".ppt", ".pptx", ".doc", ".docx"]
 image_extensions = [".png", ".jpg", ".jpeg"]
+
 
 class MemoryDataWriter(DataWriter):
     def __init__(self):
@@ -73,7 +76,7 @@ def init_writers(
     Returns:
         Tuple[writer, image_writer, file_bytes]: Returns initialized writer tuple and file content
     """
-    file_extension:str = None
+    file_extension: str = None
     if file_path:
         is_s3_path = file_path.startswith("s3://")
         if is_s3_path:
@@ -232,7 +235,9 @@ async def file_parse(
         )
 
         # Process PDF
-        infer_result, pipe_result = process_file(file_bytes, file_extension, parse_method, image_writer)
+        infer_result, pipe_result = process_file(
+            file_bytes, file_extension, parse_method, image_writer
+        )
 
         # Use MemoryDataWriter to get results
         content_list_writer = MemoryDataWriter()
@@ -264,7 +269,9 @@ async def file_parse(
                 json.dumps(model_json, indent=4, ensure_ascii=False),
             )
             # Save visualization results
-            pipe_result.draw_layout(os.path.join(output_path, f"{file_name}_layout.pdf"))
+            pipe_result.draw_layout(
+                os.path.join(output_path, f"{file_name}_layout.pdf")
+            )
             pipe_result.draw_span(os.path.join(output_path, f"{file_name}_spans.pdf"))
             pipe_result.draw_line_sort(
                 os.path.join(output_path, f"{file_name}_line_sort.pdf")
@@ -295,6 +302,211 @@ async def file_parse(
         middle_json_writer.close()
 
         return JSONResponse(data, status_code=200)
+
+    except Exception as e:
+        logger.exception(e)
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.post(
+    "/multi_file_parse",
+    tags=["projects"],
+    summary="Parse multiple files and return results as ZIP",
+)
+async def multi_file_parse(
+    files: List[UploadFile],
+    parse_method: str = Form("auto"),
+    is_json_md_dump: bool = Form(True),
+    return_layout: bool = Form(False),
+    return_info: bool = Form(False),
+    return_content_list: bool = Form(False),
+):
+    """
+    Execute the process of converting multiple PDF files to JSON and MD,
+    outputting all results as a ZIP file.
+
+    Args:
+        files: List of PDF files to be parsed
+        parse_method: Parsing method, can be auto, ocr, or txt. Default is auto
+        is_json_md_dump: Whether to write parsed data to .json and .md files. Default to True
+        return_layout: Whether to include parsed PDF layout in results. Default to False
+        return_info: Whether to include parsed PDF info in results. Default to False
+        return_content_list: Whether to include parsed PDF content list in results. Default to False
+
+    Returns:
+        ZIP file containing all processed results
+    """
+    try:
+        if not files:
+            return JSONResponse(
+                content={"error": "No files provided"},
+                status_code=400,
+            )
+
+        # 创建临时目录用于存储所有处理结果
+        temp_dir = tempfile.mkdtemp()
+        results_summary = []
+
+        try:
+            for file_idx, file in enumerate(files):
+                if not file.filename:
+                    continue
+
+                # 获取文件名（不含扩展名）
+                file_name = os.path.splitext(file.filename)[0]
+                output_path = os.path.join(temp_dir, file_name)
+                output_image_path = os.path.join(output_path, "images")
+
+                # 创建输出目录
+                os.makedirs(output_path, exist_ok=True)
+                os.makedirs(output_image_path, exist_ok=True)
+
+                try:
+                    # 初始化writers
+                    writer = FileBasedDataWriter(output_path)
+                    image_writer = FileBasedDataWriter(output_image_path)
+
+                    # 读取文件内容
+                    file_bytes = await file.read()
+                    file_extension = os.path.splitext(file.filename)[1]
+
+                    # 处理文件
+                    infer_result, pipe_result = process_file(
+                        file_bytes, file_extension, parse_method, image_writer
+                    )
+
+                    # 使用内存writer获取结果
+                    content_list_writer = MemoryDataWriter()
+                    md_content_writer = MemoryDataWriter()
+                    middle_json_writer = MemoryDataWriter()
+
+                    # 导出数据
+                    pipe_result.dump_content_list(content_list_writer, "", "images")
+                    pipe_result.dump_md(md_content_writer, "", "images")
+                    pipe_result.dump_middle_json(middle_json_writer, "")
+
+                    # 获取内容
+                    content_list = json.loads(content_list_writer.get_value())
+                    md_content = md_content_writer.get_value()
+                    middle_json = json.loads(middle_json_writer.get_value())
+                    model_json = infer_result.get_infer_res()
+
+                    # 保存文件到临时目录
+                    if is_json_md_dump:
+                        # 保存基本文件
+                        writer.write_string(f"{file_name}.md", md_content)
+                        writer.write_string(
+                            f"{file_name}_content_list.json",
+                            json.dumps(content_list, indent=4, ensure_ascii=False),
+                        )
+                        writer.write_string(
+                            f"{file_name}_middle.json",
+                            json.dumps(middle_json, indent=4, ensure_ascii=False),
+                        )
+                        writer.write_string(
+                            f"{file_name}_model.json",
+                            json.dumps(model_json, indent=4, ensure_ascii=False),
+                        )
+
+                        # 保存可视化结果
+                        try:
+                            pipe_result.draw_layout(
+                                os.path.join(output_path, f"{file_name}_layout.pdf")
+                            )
+                            pipe_result.draw_span(
+                                os.path.join(output_path, f"{file_name}_spans.pdf")
+                            )
+                            pipe_result.draw_line_sort(
+                                os.path.join(output_path, f"{file_name}_line_sort.pdf")
+                            )
+                            infer_result.draw_model(
+                                os.path.join(output_path, f"{file_name}_model.pdf")
+                            )
+                        except Exception as viz_error:
+                            logger.warning(
+                                f"Failed to generate visualization for {file_name}: {viz_error}"
+                            )
+
+                    # 构建结果摘要
+                    result_summary = {
+                        "filename": file.filename,
+                        "status": "success",
+                        "md_content": md_content,
+                    }
+
+                    if return_layout:
+                        result_summary["layout"] = model_json
+                    if return_info:
+                        result_summary["info"] = middle_json
+                    if return_content_list:
+                        result_summary["content_list"] = content_list
+
+                    results_summary.append(result_summary)
+
+                    # 清理内存writers
+                    content_list_writer.close()
+                    md_content_writer.close()
+                    middle_json_writer.close()
+
+                except Exception as file_error:
+                    logger.error(f"Error processing file {file.filename}: {file_error}")
+                    results_summary.append(
+                        {
+                            "filename": file.filename,
+                            "status": "error",
+                            "error": str(file_error),
+                        }
+                    )
+
+            # 创建结果摘要文件
+            summary_path = os.path.join(temp_dir, "processing_summary.json")
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(results_summary, f, indent=4, ensure_ascii=False)
+
+            # 创建ZIP文件
+            zip_path = os.path.join(temp_dir, "processed_files.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                for root, dirs, files_in_dir in os.walk(temp_dir):
+                    for file_in_dir in files_in_dir:
+                        if file_in_dir == "processed_files.zip":
+                            continue
+                        file_path = os.path.join(root, file_in_dir)
+                        arcname = os.path.relpath(file_path, temp_dir)
+                        zipf.write(file_path, arcname)
+
+            # 返回ZIP文件
+            def cleanup_and_stream():
+                try:
+                    with open(zip_path, "rb") as f:
+                        while True:
+                            chunk = f.read(8192)
+                            if not chunk:
+                                break
+                            yield chunk
+                finally:
+                    # 清理临时目录
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            f"Failed to cleanup temp directory: {cleanup_error}"
+                        )
+
+            return StreamingResponse(
+                cleanup_and_stream(),
+                media_type="application/zip",
+                headers={
+                    "Content-Disposition": "attachment; filename=processed_files.zip"
+                },
+            )
+
+        except Exception as process_error:
+            # 清理临时目录
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
+            raise process_error
 
     except Exception as e:
         logger.exception(e)

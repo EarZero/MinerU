@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  mineru-api:
+    image: mineru-api:0.0.1
+    container_name: mineru-api
+    restart: unless-stopped
+    ports:
+      - "8312:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LANG=C.UTF-8
+    volumes:
+      # 挂载输出目录用于保存处理结果
+      - ./output:/app/output
+      # 挂载配置文件目录（可选）
+      - ./magic-pdf.json:/root/magic-pdf.json:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - mineru-network
+
+networks:
+  mineru-network:
+    driver: bridge
